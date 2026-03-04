@@ -18,6 +18,8 @@ import (
 	"github.com/gardener/gardener/pkg/controllerutils"
 	glogger "github.com/gardener/gardener/pkg/logger"
 	"github.com/urfave/cli/v3"
+	"go.opentelemetry.io/collector/processor/batchprocessor"
+	"go.opentelemetry.io/collector/processor/memorylimiterprocessor"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
@@ -54,6 +56,18 @@ type flags struct {
 	pprofBindAddr             string
 	clientConnQPS             float32
 	clientConnBurst           int32
+
+	// Memory Limiter Processor flags
+	memLimiterCheckInterval        time.Duration
+	memLimiterLimitMiB             uint32
+	memLimiterSpikeLimitMiB        uint32
+	memLimiterLimitPercentage      uint32
+	memLimiterSpikeLimitPercentage uint32
+
+	// Batch Processor flags
+	batchProcessorTimeout      time.Duration
+	batchProcessorBatchSize    uint32
+	batchProcessorBatchMaxSize uint32
 
 	// The following flags are meant to be specified by the Helm chart,
 	// which gardenlet will invoke during deployment. The value of each flag
@@ -303,6 +317,58 @@ func New() *cli.Command {
 					return nil
 				},
 			},
+			&cli.DurationFlag{
+				Name:        "mem-limiter-check-interval",
+				Usage:       "time between measurements of the memory usage",
+				Value:       time.Second,
+				Sources:     cli.EnvVars("MEM_LIMITER_CHECK_INTERVAL"),
+				Destination: &flags.memLimiterCheckInterval,
+			},
+			&cli.Uint32Flag{
+				Name:        "mem-limiter-limit-mib",
+				Usage:       "max amount of memory in MiB allocated to the process",
+				Sources:     cli.EnvVars("MEM_LIMITER_LIMIT_MIB"),
+				Destination: &flags.memLimiterLimitMiB,
+			},
+			&cli.Uint32Flag{
+				Name:        "mem-limiter-limit-percentage",
+				Usage:       "max amount of memory allocated to the process in percentage of total memory",
+				Value:       75,
+				Sources:     cli.EnvVars("MEM_LIMITER_LIMIT_PERCENTAGE"),
+				Destination: &flags.memLimiterLimitPercentage,
+			},
+			&cli.Uint32Flag{
+				Name:        "mem-limiter-spike-limit-mib",
+				Usage:       "max amount of spike between measurements in MiB",
+				Sources:     cli.EnvVars("MEM_LIMITER_SPIKE_LIMIT_MIB"),
+				Destination: &flags.memLimiterSpikeLimitMiB,
+			},
+			&cli.Uint32Flag{
+				Name:        "mem-limiter-spike-limit-percentage",
+				Usage:       "max amount of spike between measurements in percentage of total memory",
+				Sources:     cli.EnvVars("MEM_LIMITER_SPIKE_LIMIT_PERCENTAGE"),
+				Destination: &flags.memLimiterSpikeLimitPercentage,
+			},
+			&cli.DurationFlag{
+				Name:        "batch-processor-timeout",
+				Usage:       "time after which a batch is sent regardless of size",
+				Value:       5 * time.Second,
+				Sources:     cli.EnvVars("BATCH_PROCESSOR_TIMEOUT"),
+				Destination: &flags.batchProcessorTimeout,
+			},
+			&cli.Uint32Flag{
+				Name:        "batch-processor-batch-size",
+				Usage:       "send batch when it reaches this size of items",
+				Sources:     cli.EnvVars("BATCH_PROCESSOR_BATCH_SIZE"),
+				Destination: &flags.batchProcessorBatchSize,
+			},
+			&cli.Uint32Flag{
+				Name:        "batch-processor-batch-max-size",
+				Usage:       "max size of a batch. when non-zero, its value must be larger than batch-size option",
+				Value:       0,
+				Sources:     cli.EnvVars("BATCH_PROCESSOR_BATCH_MAX_SIZE"),
+				Destination: &flags.batchProcessorBatchMaxSize,
+			},
 		},
 		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
 			ctrllog.SetLogger(glogger.MustNewZapLogger(flags.zapLogLevel, flags.zapLogFormat))
@@ -328,12 +394,28 @@ func runManager(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	logger.Info("creating actuators")
+
+	memLimiterConfig := &memorylimiterprocessor.Config{
+		CheckInterval:         flags.memLimiterCheckInterval,
+		MemoryLimitMiB:        flags.memLimiterLimitMiB,
+		MemoryLimitPercentage: flags.memLimiterLimitPercentage,
+		MemorySpikeLimitMiB:   flags.memLimiterSpikeLimitMiB,
+		MemorySpikePercentage: flags.memLimiterSpikeLimitPercentage,
+	}
+	batchProcessorConfig := &batchprocessor.Config{
+		Timeout:          flags.batchProcessorTimeout,
+		SendBatchSize:    flags.batchProcessorBatchSize,
+		SendBatchMaxSize: flags.batchProcessorBatchMaxSize,
+	}
+
 	decoder := serializer.NewCodecFactory(m.GetScheme(), serializer.EnableStrict).UniversalDecoder()
 	act, err := actuator.New(
 		m.GetClient(),
 		actuator.WithDecoder(decoder),
 		actuator.WithGardenerVersion(flags.gardenerVersion),
 		actuator.WithGardenletFeatures(flags.gardenletFeatureGates),
+		actuator.WithMemoryLimiterProcessorConfig(memLimiterConfig),
+		actuator.WithBatchProcessorConfig(batchProcessorConfig),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create actuator: %w", err)
